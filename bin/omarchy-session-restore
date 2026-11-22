@@ -1,33 +1,93 @@
 #!/bin/bash
 
 # omarchy:summary=Relaunch windows saved by omarchy-session-save onto their workspaces
-# omarchy:args=[--dry-run]
+# omarchy:args=[--dry-run] [--manifest <file>] [--keep] [--to <workspace>] [--skip-running]
+
+# With no options this is the next-boot restore: it replays the boot manifest
+# once, consumes it, and resumes herdr agents. omarchy-workspace-restore uses
+# --manifest with --keep to replay a named preset as often as you like:
+#   --keep          leave the manifest in place and skip the herdr agent resume
+#   --to <id>       put every window on this workspace instead of its saved one
+#   --skip-running  don't relaunch an app whose class already has a window on
+#                   the target workspace (one skip per open window)
 
 set -euo pipefail
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
-MANIFEST="$HOME/.local/state/omarchy/session.json"
-mkdir -p "$(dirname "$MANIFEST")"
-LOG="${MANIFEST%.json}-restore.log"
+STATE_DIR="$HOME/.local/state/omarchy"
+MANIFEST="$STATE_DIR/session.json"
+LOG="$STATE_DIR/session-restore.log"
+
+dry_run=false
+keep=false
+to_ws=""
+skip_running=false
+
+while (($# > 0)); do
+  case "$1" in
+    --dry-run) dry_run=true ;;
+    --manifest)
+      shift
+      [[ -n ${1:-} ]] || { echo "--manifest needs a file path" >&2; exit 1; }
+      MANIFEST=$1
+      ;;
+    --keep) keep=true ;;
+    --to)
+      shift
+      [[ ${1:-} =~ ^[0-9]+$ ]] || { echo "--to needs a numeric workspace id" >&2; exit 1; }
+      to_ws=$1
+      ;;
+    --skip-running) skip_running=true ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+mkdir -p "$STATE_DIR"
 
 log() {
   printf '%s restore: %s\n' "$(date --iso-8601=seconds)" "$*" >>"$LOG"
 }
 
-# Only one restore may run at a time: the shell plugin service and the
-# post-boot hook can both fire around login.
-exec 9>"${MANIFEST%.json}.lock"
-flock -n 9 || exit 0
-
 [[ -f $MANIFEST ]] || exit 0
 
-dry_run=false
-[[ ${1:-} == --dry-run ]] && dry_run=true
+# Only one restore of a manifest may run at a time: the shell plugin service
+# and the post-boot hook can both fire around login. The boot manifest keeps
+# its session.lock; any other manifest gets a lock named after its path.
+if [[ $MANIFEST == "$STATE_DIR/session.json" ]]; then
+  lock="$STATE_DIR/session.lock"
+else
+  mkdir -p "$STATE_DIR/locks"
+  lock="$STATE_DIR/locks/$(realpath "$MANIFEST" | sha1sum | cut -c1-16).lock"
+fi
+exec 9>"$lock"
+flock -n 9 || exit 0
 
-$dry_run || log "started ($(jq 'length' "$MANIFEST") window(s))"
+$dry_run || log "started $MANIFEST ($(jq 'length' "$MANIFEST") window(s))"
 
 launcher=""
 command -v uwsm-app &>/dev/null && launcher="uwsm-app -- "
+
+# Windows already open, as "<workspace> <class>" lines, so --skip-running can
+# claim one per saved entry instead of launching a duplicate.
+open_windows=""
+$skip_running && open_windows=$(hyprctl clients -j | jq -r '.[] | "\(.workspace.id) \(.class)"')
+
+claim_open_window() {
+  local key="$1 $2" line rest="" found=false
+  while IFS= read -r line; do
+    if ! $found && [[ $line == "$key" ]]; then
+      found=true
+      continue
+    fi
+    rest+="$line"$'\n'
+  done <<<"$open_windows"
+  open_windows=${rest%$'\n'}
+  $found
+}
+
+launched=0
+skipped=0
 
 while IFS= read -r entry; do
   ws=$(jq -r '.workspace' <<<"$entry")
@@ -35,6 +95,14 @@ while IFS= read -r entry; do
   cmd=$(jq -r '.cmd' <<<"$entry")
   cwd=$(jq -r '.cwd' <<<"$entry")
   floating=$(jq -r '.floating' <<<"$entry")
+  [[ -n $to_ws ]] && ws=$to_ws
+
+  if $skip_running && claim_open_window "$ws" "$class"; then
+    skipped=$((skipped + 1))
+    $dry_run && echo "# skip $class: already open on workspace $ws"
+    $dry_run || log "skipped $class: already open on workspace $ws"
+    continue
+  fi
 
   # Terminals: start in the saved working directory
   if [[ -n $cwd ]]; then
@@ -62,14 +130,24 @@ while IFS= read -r entry; do
     fi
     sleep 0.2 # stagger launches so the compositor applies each workspace rule cleanly
   fi
+  launched=$((launched + 1))
 done < <(jq -c '.[]' "$MANIFEST")
+
+if $dry_run; then
+  echo "# $launched to launch, $skipped already open"
+else
+  log "completed: $launched launched, $skipped skipped"
+  # With --keep, print "<launched> <skipped>" for omarchy-workspace-restore to report
+  $keep && echo "$launched $skipped"
+fi
+
+$keep && exit 0
 
 # Consume the manifest so the next boot doesn't relaunch everything again
 $dry_run || mv "$MANIFEST" "$MANIFEST.restored"
-$dry_run || log "completed"
 
 # Resume AI agents inside herdr once its relaunched window brings the server up
-if [[ -f $HOME/.local/state/omarchy/herdr-agents.json ]]; then
+if [[ -f $STATE_DIR/herdr-agents.json ]]; then
   if $dry_run; then
     "$SCRIPT_DIR/omarchy-session-restore-agents" --dry-run
   else

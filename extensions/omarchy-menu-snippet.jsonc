@@ -6,9 +6,19 @@
   // The reboot/shutdown overrides save the session automatically first
   // (joined with ";" so a failed save never blocks the power action).
   //
+  // "Workspaces" adds a root submenu for named workspace presets: save the
+  // current workspace, restore one to where it was saved or onto the current
+  // workspace, and delete one. Each asks for the name in the menu.
+  //
   // For a manual (non-plugin) install, replace the plugin path with
-  // ~/.local/bin/omarchy-session-save
-  "system.session-save": {"icon":"󰆓","label":"Save Session","description":"Save open windows to restore on next boot","action":"~/.config/omarchy/plugins/io.github.wbarakat.session-restore/bin/omarchy-session-save --quiet && notify-send 'Session saved' 'Your windows will be restored on next boot'"},
-  "system.reboot": {"icon":"󰜉","label":"Reboot","action":"~/.config/omarchy/plugins/io.github.wbarakat.session-restore/bin/omarchy-session-save --quiet; omarchy-system-reboot"},
-  "system.shutdown": {"icon":"󰐥","label":"Shutdown","action":"~/.config/omarchy/plugins/io.github.wbarakat.session-restore/bin/omarchy-session-save --quiet; omarchy-system-shutdown"}
+  // ~/.local/bin/
+  "system.session-save": {"icon":"󰆓","label":"Save Session","description":"Save open windows to restore on next boot","action":"~/.config/omarchy/plugins/io.github.aledlewis.session-restore/bin/omarchy-session-save --quiet && notify-send 'Session saved' 'Your windows will be restored on next boot'"},
+  "system.reboot": {"icon":"󰜉","label":"Reboot","action":"~/.config/omarchy/plugins/io.github.aledlewis.session-restore/bin/omarchy-session-save --quiet; omarchy-system-reboot"},
+  "system.shutdown": {"icon":"󰐥","label":"Shutdown","action":"~/.config/omarchy/plugins/io.github.aledlewis.session-restore/bin/omarchy-session-save --quiet; omarchy-system-shutdown"},
+
+  "workspaces": {"icon":"󰕰","label":"Workspaces","description":"Save and restore the apps on a workspace"},
+  "workspaces.save": {"icon":"󰆓","label":"Save Workspace","description":"Save the apps on this workspace under a name","action":"~/.config/omarchy/plugins/io.github.aledlewis.session-restore/bin/omarchy-workspace-save"},
+  "workspaces.restore": {"icon":"󰑓","label":"Restore Workspace","description":"Reopen a saved workspace where it was saved","action":"~/.config/omarchy/plugins/io.github.aledlewis.session-restore/bin/omarchy-workspace-restore"},
+  "workspaces.restore-here": {"icon":"󰁔","label":"Restore Workspace Here","description":"Reopen a saved workspace on this workspace","action":"~/.config/omarchy/plugins/io.github.aledlewis.session-restore/bin/omarchy-workspace-restore --here"},
+  "workspaces.delete": {"icon":"󰆴","label":"Delete Saved Workspace","description":"Forget a saved workspace (closes nothing)","action":"~/.config/omarchy/plugins/io.github.aledlewis.session-restore/bin/omarchy-workspace-delete"}
 }

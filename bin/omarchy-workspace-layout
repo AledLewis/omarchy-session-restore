@@ -1,0 +1,259 @@
+#!/usr/bin/python3 -I
+"""Rebuild a saved workspace preset's dwindle layout on an empty workspace.
+
+Usage: omarchy-workspace-layout --manifest FILE --to WORKSPACE [--dry-run]
+
+Hyprland doesn't report its tiling tree, only where each window ended up. A
+dwindle layout is always a series of straight cuts, though, so the tree can be
+recovered from the saved rectangles: find a line that splits the windows into
+two groups, then do the same inside each group.
+
+The tree is then replayed one window at a time. For each split, the window
+holding that region is focused, Hyprland is told which side the next window
+goes on (preselect), the first window of the other side is launched and waited
+for, and the split ratio is set while those two are still direct siblings.
+Floating windows are launched last and put back at their saved size and
+position.
+
+Prints "<launched> <failed>" for omarchy-workspace-restore. A window that never
+appears (an app that refuses a second instance, say) is left out and the
+layout closes up around it.
+"""
+import argparse, json, os, shlex, shutil, subprocess, sys, time
+from datetime import datetime
+from dataclasses import dataclass, field
+
+LOG = os.path.expanduser("~/.local/state/omarchy/session-restore.log")
+TOLERANCE = 4      # px slack when deciding which side of a cut a window is on
+WAIT_SECONDS = 20  # how long to wait for each window to appear
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write(f"{datetime.now().astimezone().isoformat(timespec='seconds')} layout: {msg}\n")
+
+
+def hyprctl_json(*args):
+    out = subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True).stdout
+    return json.loads(out or "null")
+
+
+def lua_string(s):
+    level = ""
+    while f"]{level}]" in s:
+        level += "="
+    return f"[{level}[{s}]{level}]"
+
+
+def dispatch(lua):
+    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True)
+
+
+# --- layout tree -----------------------------------------------------------
+
+@dataclass(eq=False)
+class Leaf:
+    entry: dict
+
+    @property
+    def rect(self):
+        (x, y), (w, h) = self.entry["at"], self.entry["size"]
+        return x, y, x + w, y + h
+
+
+@dataclass(eq=False)
+class Split:
+    direction: str   # "r": second is right of first, "d": second is below
+    ratio: float     # dwindle split ratio: 1.0 is even, first side gets ratio/2
+    first: object
+    second: object
+
+
+@dataclass(eq=False)
+class Group:
+    """Windows that no straight cut separates (e.g. overlapping): opened in order."""
+    leaves: list = field(default_factory=list)
+
+
+def leaves_of(node):
+    if isinstance(node, Leaf):
+        return [node]
+    if isinstance(node, Group):
+        return list(node.leaves)
+    return leaves_of(node.first) + leaves_of(node.second)
+
+
+def build_tree(leaves):
+    if len(leaves) == 1:
+        return leaves[0]
+    for axis, direction in ((0, "r"), (1, "d")):
+        lo, hi = axis, axis + 2
+        # Try cuts from the near edge outwards, so the first window keeps the
+        # biggest region the way dwindle builds it (A | (B / C)).
+        for cut in sorted({l.rect[hi] for l in leaves}):
+            first = [l for l in leaves if l.rect[hi] <= cut + TOLERANCE]
+            second = [l for l in leaves if l.rect[lo] >= cut - TOLERANCE and l not in first]
+            if first and second and len(first) + len(second) == len(leaves):
+                start = min(l.rect[lo] for l in leaves)
+                end = max(l.rect[hi] for l in leaves)
+                line = (max(l.rect[hi] for l in first) + min(l.rect[lo] for l in second)) / 2
+                ratio = min(1.9, max(0.1, 2 * (line - start) / (end - start)))
+                return Split(direction, round(ratio, 4), build_tree(first), build_tree(second))
+    return Group(leaves)
+
+
+def prune(node, leaf):
+    """The tree without `leaf`, closing up the split it was in."""
+    if isinstance(node, Leaf):
+        return None if node is leaf else node
+    if isinstance(node, Group):
+        rest = [l for l in node.leaves if l is not leaf]
+        return None if not rest else rest[0] if len(rest) == 1 else Group(rest)
+    first, second = prune(node.first, leaf), prune(node.second, leaf)
+    if first is None or second is None:
+        return first or second
+    return Split(node.direction, node.ratio, first, second)
+
+
+def describe(node, indent=""):
+    if isinstance(node, Leaf):
+        e = node.entry
+        where = f" in {e['cwd']}" if e.get("cwd") else ""
+        return f"{indent}{e['class']}{where}\n"
+    if isinstance(node, Group):
+        return "".join(describe(l, indent) for l in node.leaves)
+    side = "left | right" if node.direction == "r" else "top / bottom"
+    return (f"{indent}split {side}, ratio {node.ratio}\n"
+            + describe(node.first, indent + "  ") + describe(node.second, indent + "  "))
+
+
+# --- replay ----------------------------------------------------------------
+
+class Builder:
+    def __init__(self, workspace):
+        self.ws = workspace
+        self.launcher = "uwsm-app -- " if shutil.which("uwsm-app") else ""
+        self.launched = 0
+        self.failed = 0
+
+    def command(self, entry, rules):
+        cmd = entry["cmd"]
+        if entry.get("cwd"):
+            cmd = "sh -c " + shlex.quote(f"cd {shlex.quote(entry['cwd'])} && exec {cmd}")
+        return f"[{rules}] {self.launcher}{cmd}"
+
+    def launch(self, leaf, rules=None):
+        """Launch a window and wait for it on the workspace; its address, or None."""
+        entry = leaf.entry
+        known = {c["address"] for c in hyprctl_json("clients")}
+        exec_arg = self.command(entry, rules or f"workspace {self.ws}")
+        subprocess.run(["hyprctl", "eval", f"hl.dispatch(hl.dsp.exec_cmd({lua_string(exec_arg)}))"],
+                       capture_output=True)
+        deadline = time.time() + WAIT_SECONDS
+        while time.time() < deadline:
+            time.sleep(0.15)
+            for c in hyprctl_json("clients"):
+                if (c["address"] not in known and c["workspace"]["id"] == self.ws
+                        and c["class"].lower() == entry["class"].lower()):
+                    time.sleep(0.15)  # let the layout settle before the next step
+                    self.launched += 1
+                    log(f"opened {entry['class']} on workspace {self.ws}")
+                    return c["address"]
+        self.failed += 1
+        log(f"gave up waiting for {entry['class']} on workspace {self.ws}")
+        return None
+
+    def focus(self, address):
+        dispatch(f'hl.dsp.focus({{ window = "address:{address}" }})')
+
+    def realize(self, node, anchor):
+        """Lay out `node` in the region currently held by window `anchor`."""
+        if isinstance(node, Leaf):
+            return
+        if isinstance(node, Group):
+            for leaf in node.leaves[1:]:
+                self.focus(anchor)
+                self.launch(leaf)
+            return
+        second, new = node.second, None
+        while second is not None:
+            leaf = leaves_of(second)[0]
+            self.focus(anchor)
+            dispatch(f'hl.dsp.layout("preselect {node.direction}")')
+            new = self.launch(leaf)
+            if new:
+                break
+            second = prune(second, leaf)
+        if new is None:
+            self.realize(node.first, anchor)
+            return
+        # anchor and the new window are now the two halves of this split
+        self.focus(anchor)
+        dispatch(f'hl.dsp.layout("splitratio {node.ratio} exact")')
+        self.realize(node.first, anchor)
+        self.realize(second, new)
+
+    def build(self, tree):
+        dispatch(f'hl.dsp.focus({{ workspace = "{self.ws}" }})')
+        while tree is not None:
+            leaf = leaves_of(tree)[0]
+            root = self.launch(leaf)
+            if root:
+                self.realize(tree, root)
+                return root
+            tree = prune(tree, leaf)
+        return None
+
+    def place_floating(self, leaf):
+        address = self.launch(leaf, f"workspace {self.ws}; float")
+        if not address:
+            return
+        ws = next((w for w in hyprctl_json("workspaces") if w["id"] == self.ws), None)
+        mon = next((m for m in hyprctl_json("monitors") if ws and m["id"] == ws["monitorID"]), None)
+        ox, oy = (mon["x"], mon["y"]) if mon else (0, 0)
+        (x, y), (w, h) = leaf.entry["at"], leaf.entry["size"]
+        target = f'window = "address:{address}"'
+        dispatch(f"hl.dsp.window.resize({{ {target}, x = {w}, y = {h} }})")
+        dispatch(f"hl.dsp.window.move({{ {target}, x = {ox + x}, y = {oy + y} }})")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--to", type=int, required=True)
+    p.add_argument("--dry-run", action="store_true")
+    args = p.parse_args()
+
+    with open(args.manifest) as f:
+        entries = json.load(f)
+    if not all("at" in e and "size" in e for e in entries):
+        sys.exit("preset was saved without window geometry; save it again")
+
+    tiled = [Leaf(e) for e in entries if not e.get("floating")]
+    floating = [Leaf(e) for e in entries if e.get("floating")]
+    tree = build_tree(tiled) if tiled else None
+
+    if args.dry_run:
+        print(f"# layout for workspace {args.to}")
+        if tree:
+            print(describe(tree), end="")
+        for leaf in floating:
+            e = leaf.entry
+            print(f"floating {e['class']} at {e['at']} size {e['size']}")
+        return
+
+    log(f"started {args.manifest} on workspace {args.to} ({len(entries)} window(s))")
+    builder = Builder(args.to)
+    first = builder.build(tree) if tree else None
+    if not tree:
+        dispatch(f'hl.dsp.focus({{ workspace = "{args.to}" }})')
+    for leaf in floating:
+        builder.place_floating(leaf)
+    if first:
+        builder.focus(first)
+    log(f"completed: {builder.launched} launched, {builder.failed} failed")
+    print(builder.launched, builder.failed)
+
+
+if __name__ == "__main__":
+    main()

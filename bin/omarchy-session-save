@@ -1,22 +1,52 @@
 #!/bin/bash
 
 # omarchy:summary=Save open windows and their workspaces for restore on next boot
-# omarchy:args=[--quiet]
+# omarchy:args=[--quiet] [--workspace <id>] [--output <file>] [--no-agents]
+
+# With no options this snapshots every window for the next-boot restore.
+# --workspace limits the snapshot to one workspace and --output writes it
+# somewhere other than the boot manifest; omarchy-workspace-save uses both.
 
 set -euo pipefail
 
 STATE_DIR="$HOME/.local/state/omarchy"
 MANIFEST="$STATE_DIR/session.json"
-mkdir -p "$STATE_DIR"
 LOG="$STATE_DIR/session-restore.log"
+
+quiet=false
+only_ws=""
+agents=true
+
+while (($# > 0)); do
+  case "$1" in
+    --quiet) quiet=true ;;
+    --workspace)
+      shift
+      [[ ${1:-} =~ ^[0-9]+$ ]] || { echo "--workspace needs a numeric workspace id" >&2; exit 1; }
+      only_ws=$1
+      ;;
+    --output)
+      shift
+      [[ -n ${1:-} ]] || { echo "--output needs a file path" >&2; exit 1; }
+      MANIFEST=$1
+      ;;
+    --no-agents) agents=false ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+mkdir -p "$STATE_DIR" "$(dirname "$MANIFEST")"
 
 log() {
   printf '%s save: %s\n' "$(date --iso-8601=seconds)" "$*" >>"$LOG"
 }
 
-log "started"
+log "started${only_ws:+ (workspace $only_ws)}"
 
 TERMINAL_CLASSES=(Alacritty kitty foot com.mitchellh.ghostty org.wezfurlong.wezterm)
+# Browsers open one more window each time they're launched while running.
+BROWSER_CLASSES=(firefox chromium Chromium google-chrome brave-browser zen)
 SKIP_CLASSES=(walker)
 
 is_in() {
@@ -26,8 +56,40 @@ is_in() {
   return 1
 }
 
+# The desktop entry id (e.g. obsidian.desktop) whose StartupWMClass, or file
+# name, matches a window class. uwsm-app launches an entry id directly.
+desktop_entry_for() {
+  local class=$1 dir file
+  local dirs=("${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    "$HOME/.local/share/flatpak/exports/share/applications"
+    /var/lib/flatpak/exports/share/applications
+    /usr/local/share/applications /usr/share/applications)
+  for dir in "${dirs[@]}"; do
+    [[ -d $dir ]] || continue
+    file=$(grep -lixF "StartupWMClass=$class" "$dir"/*.desktop 2>/dev/null | head -n1 || true)
+    [[ -z $file && -f $dir/$class.desktop ]] && file=$dir/$class.desktop
+    if [[ -n $file ]]; then
+      basename "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
 entries=()
 seen_pids=" "
+monitors=$(hyprctl monitors -j)
+
+# Each workspace's tiling layout (dwindle, scrolling or floating), recorded so
+# a restore only rebuilds splits where the layout has them.
+declare -A layouts=()
+if command -v omarchy-hyprland-workspace-layout-current &>/dev/null; then
+  for id in $(hyprctl clients -j | jq -r '.[].workspace.id' | sort -un); do
+    ((id > 0)) || continue
+    [[ -z $only_ws || $id == "$only_ws" ]] || continue
+    layouts[$id]=$(omarchy-hyprland-workspace-layout-current "$id" 2>/dev/null || true)
+  done
+fi
 
 while IFS= read -r client; do
   class=$(jq -r '.class' <<<"$client")
@@ -36,26 +98,67 @@ while IFS= read -r client; do
   pid=$(jq -r '.pid' <<<"$client")
 
   ((ws > 0)) || continue # skip special workspaces (scratchpads)
+  [[ -z $only_ws || $ws == "$only_ws" ]] || continue
   ((pid > 0)) || continue
   is_in "$class" "${SKIP_CLASSES[@]}" && continue
   [[ -r /proc/$pid/cmdline ]] || continue
 
   # Windows sharing a process (e.g. multiple Chromium windows) can only be
-  # relaunched once, so keep the first occurrence only.
-  [[ $seen_pids == *" $pid "* ]] && continue
+  # relaunched once, so keep the first occurrence only. A workspace preset
+  # keeps every browser window: it's restored into a running browser, where
+  # each launch adds a window, and the layout needs all of them.
+  if [[ -z $only_ws ]] || ! is_in "$class" "${BROWSER_CLASSES[@]}"; then
+    [[ $seen_pids == *" $pid "* ]] && continue
+  fi
   seen_pids+="$pid "
 
-  # Rebuild a shell-safe launch command from the process's original argv
+  is_terminal=false
+  is_in "$class" "${TERMINAL_CLASSES[@]}" && is_terminal=true
+
+  # Rebuild a shell-safe launch command from the process's original argv.
+  # A terminal's own start-directory flag is dropped: it holds the directory
+  # the terminal opened in, and would override the shell's current one that
+  # the restore cds into.
+  argv=()
+  mapfile -d '' -t argv <"/proc/$pid/cmdline"
+  ((${#argv[@]} > 0)) || continue
+
+  # Electron and Chromium apps (Obsidian, VS Code, Slack...) overwrite their
+  # command line with one space-joined string, which can't be run as-is. Launch
+  # those through their desktop entry instead, and only fall back to splitting
+  # the string on spaces when there isn't one.
+  if ((${#argv[@]} == 1)) && [[ ${argv[0]} == *" "* && ! -x ${argv[0]} ]]; then
+    if desktop=$(desktop_entry_for "$class"); then
+      argv=("$desktop")
+    else
+      read -r -a argv <<<"${argv[0]}"
+    fi
+  fi
+
   cmd=""
-  while IFS= read -r -d '' arg; do
+  drop_next=false
+  for arg in "${argv[@]}"; do
+    if $drop_next; then
+      drop_next=false
+      continue
+    fi
+    if $is_terminal; then
+      case "$arg" in
+        --working-directory=* | --directory=* | --cwd=*) continue ;;
+        --working-directory | --directory | --cwd | -D)
+          drop_next=true
+          continue
+          ;;
+      esac
+    fi
     cmd+="$(printf '%q' "$arg") "
-  done <"/proc/$pid/cmdline"
+  done
   cmd=${cmd% }
   [[ -n $cmd ]] || continue
 
   # For terminals, record the shell's working directory so it can be restored
   cwd=""
-  if is_in "$class" "${TERMINAL_CLASSES[@]}"; then
+  if $is_terminal; then
     shell_pid=$(pgrep -P "$pid" 2>/dev/null | tail -n1 || true)
     if [[ -n ${shell_pid:-} ]]; then
       dir=$(readlink -f "/proc/$shell_pid/cwd" 2>/dev/null || true)
@@ -63,35 +166,51 @@ while IFS= read -r client; do
     fi
   fi
 
+  # Geometry for omarchy-workspace-layout: the window's rectangle relative to
+  # its monitor, so a layout can be rebuilt on another monitor too.
+  mon=$(jq -r '.monitor' <<<"$client")
+  origin=$(jq -c --argjson id "$mon" '(.[] | select(.id == $id) | [.x, .y]) // [0, 0]' <<<"$monitors")
+
   entries+=("$(jq -n \
     --arg class "$class" \
     --argjson workspace "$ws" \
     --argjson floating "$floating" \
     --arg cmd "$cmd" \
     --arg cwd "$cwd" \
-    '{class: $class, workspace: $workspace, floating: $floating, cmd: $cmd, cwd: $cwd}')")
+    --argjson client "$client" \
+    --argjson origin "$origin" \
+    --arg layout "${layouts[$ws]:-}" \
+    '{class: $class, workspace: $workspace, floating: $floating, cmd: $cmd, cwd: $cwd,
+      at: [$client.at[0] - $origin[0], $client.at[1] - $origin[1]], size: $client.size,
+      layout: $layout}')")
 done < <(hyprctl clients -j | jq -c '.[]')
 
 if ((${#entries[@]} == 0)); then
-  rm -f "$MANIFEST"
   log "no windows found"
-  [[ ${1:-} == --quiet ]] || echo "No windows to save"
+  $quiet || echo "No windows to save"
+  # A named workspace preset is left alone rather than wiped by saving an
+  # empty workspace, and the caller gets a non-zero status to report it.
+  [[ -n $only_ws ]] && exit 2
+  rm -f "$MANIFEST"
   exit 0
 fi
 
-printf '%s\n' "${entries[@]}" | jq -s '.' >"$MANIFEST"
+printf '%s\n' "${entries[@]}" | jq -s '.' >"$MANIFEST.tmp"
+mv "$MANIFEST.tmp" "$MANIFEST"
 
 # Snapshot herdr agent panes so omarchy-session-restore-agents can resume them
-AGENTS="$STATE_DIR/herdr-agents.json"
 agent_count=0
-rm -f "$AGENTS"
-if command -v herdr &>/dev/null; then
-  if agents_json=$(herdr agent list 2>/dev/null) &&
-    [[ $(jq '.result.agents | length' <<<"$agents_json" 2>/dev/null || echo 0) -gt 0 ]]; then
-    jq '[.result.agents[] | {agent, pane_id, cwd}]' <<<"$agents_json" >"$AGENTS"
-    agent_count=$(jq 'length' "$AGENTS")
+if $agents; then
+  AGENTS="$STATE_DIR/herdr-agents.json"
+  rm -f "$AGENTS"
+  if command -v herdr &>/dev/null; then
+    if agents_json=$(herdr agent list 2>/dev/null) &&
+      [[ $(jq '.result.agents | length' <<<"$agents_json" 2>/dev/null || echo 0) -gt 0 ]]; then
+      jq '[.result.agents[] | {agent, pane_id, cwd}]' <<<"$agents_json" >"$AGENTS"
+      agent_count=$(jq 'length' "$AGENTS")
+    fi
   fi
 fi
 
-log "saved ${#entries[@]} window(s) and $agent_count agent(s)"
-[[ ${1:-} == --quiet ]] || echo "Saved ${#entries[@]} window(s) to $MANIFEST"
+log "saved ${#entries[@]} window(s) and $agent_count agent(s) to $MANIFEST"
+$quiet || echo "Saved ${#entries[@]} window(s) to $MANIFEST"

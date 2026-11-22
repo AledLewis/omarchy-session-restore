@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# omarchy:summary=Relaunch a saved workspace preset
+# omarchy:args=[name] [--here | --to <id>] [--no-layout] [--dry-run] [--list]
+# omarchy:examples=omarchy-workspace-restore work|omarchy-workspace-restore work --here|omarchy-workspace-restore --list
+
+# Windows go back to the workspace they were saved from, or with --here to
+# the one you're on (--to picks another). Apps that already have a window on
+# the target workspace aren't launched again, so restoring twice is harmless.
+# Without a name, asks for a preset in the Omarchy menu.
+#
+# On an empty dwindle workspace the saved tiling layout is rebuilt exactly
+# (omarchy-workspace-layout): windows open one at a time in their saved
+# places and split sizes. This shows the workspace while it's being built.
+# Otherwise, or with --no-layout, the apps are launched in the background
+# and Hyprland tiles them as they arrive.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+lib="$SCRIPT_DIR/../lib/workspace-presets.sh" # plugin install
+[[ -f $lib ]] || lib="$HOME/.local/lib/omarchy-session-restore/workspace-presets.sh" # install.sh
+source "$lib"
+
+name=""
+to_ws=""
+here=false
+dry_run=false
+use_layout=true
+
+while (($# > 0)); do
+  case "$1" in
+    --here) here=true ;;
+    --to)
+      shift
+      to_ws=${1:-}
+      ;;
+    --dry-run) dry_run=true ;;
+    --no-layout) use_layout=false ;;
+    --list)
+      list_presets | while IFS=$'\t' read -r n count ws saved; do
+        printf '%-24s %3s window(s)  workspace %-3s  saved %s\n' "$n" "$count" "$ws" "$saved"
+      done
+      exit 0
+      ;;
+    -*) echo "Unknown option: $1" >&2; exit 1 ;;
+    *) name=$1 ;;
+  esac
+  shift
+done
+
+if [[ -z $name ]]; then
+  $here && prompt="Restore workspace here" || prompt="Restore workspace"
+  name=$(pick_preset "$prompt") || exit 0
+  [[ -n $name ]] || exit 0
+fi
+
+file=$(preset_file "$name")
+if ! valid_preset_name "$name" || [[ ! -f $file ]]; then
+  report "No saved workspace \"$name\"" "omarchy-workspace-restore --list shows what's saved"
+  exit 1
+fi
+
+$here && to_ws=$(active_workspace)
+if [[ -n $to_ws ]] && { ! [[ $to_ws =~ ^[0-9]+$ ]] || ((to_ws <= 0)); }; then
+  report "Can't restore onto this workspace" "Special workspaces and scratchpads aren't supported"
+  exit 1
+fi
+
+target=${to_ws:-$(jq -r '.[0].workspace' "$file")}
+
+# The exact layout needs: geometry in the preset (saved by this version), a
+# dwindle layout where it was saved and where it's going, and nothing already
+# on the target workspace to split around.
+layout_restore() {
+  $use_layout || return 1
+  jq -e 'all(.[]; has("at") and has("size")) and all(.[]; .floating or .layout == "dwindle")' "$file" >/dev/null || return 1
+  [[ $(omarchy-hyprland-workspace-layout-current "$target" 2>/dev/null) == dwindle ]] || return 1
+  hyprctl clients -j | jq -e --argjson ws "$target" 'any(.[]; .workspace.id == $ws) | not' >/dev/null
+}
+
+if layout_restore; then
+  restorer=("$SCRIPT_DIR/omarchy-workspace-layout" --manifest "$file" --to "$target")
+else
+  restorer=("$SCRIPT_DIR/omarchy-session-restore" --manifest "$file" --keep --skip-running)
+  [[ -n $to_ws ]] && restorer+=(--to "$to_ws")
+fi
+
+if $dry_run; then
+  exec "${restorer[@]}" --dry-run
+fi
+
+read -r launched skipped < <("${restorer[@]}") || {
+  report "Restoring \"$name\" failed" "See ~/.local/state/omarchy/session-restore.log"
+  exit 1
+}
+
+# The layout restore's second number is windows that never appeared; the
+# background restore's is apps that were already open.
+if [[ ${restorer[0]} == *omarchy-workspace-layout ]]; then
+  detail="$launched app(s) on workspace $target"
+  ((skipped > 0)) && detail+=", $skipped didn't open"
+  report "Restored \"$name\"" "$detail"
+elif ((launched == 0)); then
+  report "\"$name\" is already open" "All $skipped app(s) are on workspace $target"
+else
+  detail="$launched app(s) on workspace $target"
+  ((skipped > 0)) && detail+=", $skipped already open"
+  report "Restored \"$name\"" "$detail"
+fi

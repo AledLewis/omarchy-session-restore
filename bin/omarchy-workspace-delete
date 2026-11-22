@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# omarchy:summary=Delete a saved workspace preset
+# omarchy:args=[name]
+
+# Without a name, asks for a preset in the Omarchy menu. Only the saved
+# preset is removed; no windows are closed.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+lib="$SCRIPT_DIR/../lib/workspace-presets.sh" # plugin install
+[[ -f $lib ]] || lib="$HOME/.local/lib/omarchy-session-restore/workspace-presets.sh" # install.sh
+source "$lib"
+
+name=${1:-}
+if [[ -z $name ]]; then
+  name=$(pick_preset "Delete saved workspace") || exit 0
+  [[ -n $name ]] || exit 0
+fi
+
+file=$(preset_file "$name")
+if ! valid_preset_name "$name" || [[ ! -f $file ]]; then
+  report "No saved workspace \"$name\""
+  exit 1
+fi
+
+rm -f "$file"
+report "Deleted saved workspace \"$name\""

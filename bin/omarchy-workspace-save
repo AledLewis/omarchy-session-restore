@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# omarchy:summary=Save the windows on the current workspace as a named preset
+# omarchy:args=[name] [--workspace <id>]
+# omarchy:examples=omarchy-workspace-save work|omarchy-workspace-save notes --workspace 3
+
+# Without a name, asks for one in the Omarchy menu (default: the workspace
+# number). Saving under an existing name replaces that preset.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+lib="$SCRIPT_DIR/../lib/workspace-presets.sh" # plugin install
+[[ -f $lib ]] || lib="$HOME/.local/lib/omarchy-session-restore/workspace-presets.sh" # install.sh
+source "$lib"
+
+name=""
+ws=""
+
+while (($# > 0)); do
+  case "$1" in
+    --workspace)
+      shift
+      ws=${1:-}
+      ;;
+    -*) echo "Unknown option: $1" >&2; exit 1 ;;
+    *) name=$1 ;;
+  esac
+  shift
+done
+
+[[ -n $ws ]] || ws=$(active_workspace)
+if ! [[ $ws =~ ^[0-9]+$ ]] || ((ws <= 0)); then
+  report "Can't save this workspace" "Special workspaces and scratchpads aren't supported"
+  exit 1
+fi
+
+if [[ -z $name ]]; then
+  name=$(omarchy-menu-input "Save workspace $ws as (blank = $ws)") || name=""
+  name=${name:-$ws}
+fi
+
+if ! valid_preset_name "$name"; then
+  report "Invalid name" "Use letters, numbers, spaces, dots, dashes or underscores"
+  exit 1
+fi
+
+file=$(preset_file "$name")
+existed=false
+[[ -f $file ]] && existed=true
+
+status=0
+"$SCRIPT_DIR/omarchy-session-save" --quiet --no-agents --workspace "$ws" --output "$file" || status=$?
+
+if ((status == 2)); then
+  report "Nothing to save" "Workspace $ws has no windows"
+  exit 1
+elif ((status != 0)); then
+  report "Saving workspace $ws failed" "See ~/.local/state/omarchy/session-restore.log"
+  exit 1
+fi
+
+count=$(jq 'length' "$file")
+$existed && verb="Updated" || verb="Saved"
+report "$verb workspace \"$name\"" "$count window(s) from workspace $ws"
