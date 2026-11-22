@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2026 Waleed
+Copyright (c) 2026 Waleed (original session save and restore)
+Copyright (c) 2026 Aled Lewis (workspace presets, layout restore and fixes)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -3,7 +3,7 @@
   "id": "io.github.aledlewis.session-restore",
   "name": "Session Restore",
   "version": "1.1.0",
-  "author": "Waleed",
+  "author": "Waleed, Aled Lewis",
   "description": "Save open windows before reboot or shutdown and restore them on the next boot — dual-boot friendly, with optional herdr agent resume",
   "kinds": [
     "service"

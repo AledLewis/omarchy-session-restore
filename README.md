@@ -204,4 +204,6 @@ preserve actual application state across a reboot:
 
 ## License
 
-MIT
+MIT, as the original. Session save and restore by Waleed
+([wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore));
+workspace presets, layout restore and fixes by Aled Lewis. See [LICENSE](LICENSE).
